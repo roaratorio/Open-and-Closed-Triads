@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Triad Progressions — Voicings + MIDI</title>
+  <link rel="stylesheet" href="style.css" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/p5.min.js"></script>
+</head>
+
+<body>
+  <div class="wrap">
+    <header class="header">
+      <h1>Triad Progressions</h1>
+      <p class="sub">
+        Enter triads like <code>Am</code>, <code>F</code>, <code>G</code>, <code>Cm</code> and slash chords like
+        <code>C/E</code> or <code>Am/E</code>. Choose voicing rules and export as MIDI.
+      </p>
+    </header>
+
+    <main class="main">
+      <section class="panel">
+        <div class="row">
+          <label>Progression (comma or space separated)</label>
+          <textarea id="progIn" rows="3" class="out"
+            placeholder="e.g. Am, F, G, C/E, F, G, Am"></textarea>
+          <div class="hint">
+            Chords: <code>C</code>, <code>F#</code>, <code>Bb</code>, <code>Am</code>, <code>Cm</code>, <code>D#m</code>.
+            Slash chords: <code>C/E</code>, <code>Am/E</code>. (No octave needed.)
+          </div>
+        </div>
+
+        <div class="row">
+          <label>Voicing</label>
+          <select id="voicingSel" class="out">
+            <option value="close">Close</option>
+            <option value="open">Open</option>
+            <option value="voicelead">Voice-led (minimise motion)</option>
+          </select>
+          <div class="hint">
+            Voice-led chooses inversions/octaves to keep voices close, while respecting slash bass rules.
+          </div>
+        </div>
+
+        <div class="row">
+          <label>Bass smoothness</label>
+          <div class="inline">
+            <input id="bassWeight" type="range" min="0" max="3" step="0.1" value="1.2" style="width:100%;" />
+            <div class="out" style="width:88px; text-align:center; padding:10px 8px;" id="bassWeightLabel">1.2</div>
+          </div>
+          <div class="hint">
+            0 = ignore bass smoothness, 3 = strongly prioritise smooth bass. Bass is kept below C4 where possible.
+          </div>
+        </div>
+
+        <div class="row">
+          <label>Register clamp</label>
+          <div class="inline">
+            <input id="rangeLo" class="out" value="C2" />
+            <input id="rangeHi" class="out" value="C6" />
+          </div>
+          <div class="hint">Use note names (<code>C2</code>) or MIDI numbers (<code>36</code>).</div>
+        </div>
+
+        <div class="row">
+          <label>Playback / export</label>
+          <div class="grid4">
+            <div>
+              <div class="hint">Tempo (bpm)</div>
+              <input id="bpmIn" type="number" min="20" max="240" step="1" value="60" />
+            </div>
+            <div>
+              <div class="hint">Beats per chord</div>
+              <input id="durIn" type="number" min="0.25" max="8" step="0.25" value="2" />
+            </div>
+          </div>
+        </div>
+
+        <div class="row">
+          <label>MIDI style</label>
+          <select id="midiStyleSel" class="out">
+            <option value="block">Block chords</option>
+            <option value="arpUp">Arpeggio up + rest</option>
+          </select>
+
+          <div class="grid4" style="margin-top:10px;">
+            <div>
+              <div class="hint">Arp step (beats)</div>
+              <input id="arpStepIn" type="number" min="0.05" max="8" step="0.05" value="0.25" />
+            </div>
+            <div>
+              <div class="hint">Rest after chord (beats)</div>
+              <input id="restIn" type="number" min="0" max="32" step="0.25" value="0.5" />
+            </div>
+          </div>
+
+          <div class="hint">Arpeggio plays low→high notes, then rests between chords.</div>
+        </div>
+
+        <div class="row buttons">
+          <button id="genBtn">Generate</button>
+          <button id="downloadBtn">Download MIDI</button>
+          <button id="exampleBtn" class="ghost">Load example</button>
+        </div>
+
+        <div class="row">
+          <label>Triads containing a note</label>
+          <div class="inline">
+            <input id="noteQueryIn" class="out" placeholder="e.g. G, Eb, F#" value="G" />
+            <button id="noteQueryBtn" class="ghost">Find</button>
+          </div>
+          <div class="hint">
+            Click a triad to append it to the progression.
+          </div>
+          <div id="noteQueryOut" class="out" style="white-space: normal;"></div>
+        </div>
+
+        <div class="row">
+          <label>Status</label>
+          <pre id="statusOut" class="out">(ready)</pre>
+        </div>
+
+        <div class="row">
+          <label>Sequence</label>
+          <pre id="seqOut" class="out">(not generated yet)</pre>
+        </div>
+      </section>
+
+      <section class="canvasPanel">
+        <div class="canvasHint">Visual: chord columns (hover to inspect).</div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <span>Static site: index.html + style.css + sketch.js</span>
+    </footer>
+  </div>
+
+  <script src="sketch.js"></script>
+</body>
+</html>
