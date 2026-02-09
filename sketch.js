@@ -2,14 +2,23 @@
 // Voicing: close / open / voice-led (smart inversions + octave placements)
 // Register clamp + MIDI export (block or arpUp) + p5 visual
 //
-// New in this version:
+// Version: stable (no-freeze) spacing + bass smoothing
 // - Bass line smoothness slider: weight 0..3
 // - Slash bass rule:
 //   - if slash pc is in the triad => DO NOT double; force inversion so slash tone is the lowest triad tone.
 //   - if slash pc is NOT in triad => add as extra bass note, octave-picked to be smooth vs previous bass.
 // - Bass is kept below C4 (MIDI 60) where clamp range allows.
 // - Voice-led selection uses weighted cost: upper-voice motion + bassWeight * bass motion.
-// - Triads containing a note (pitch-class) => clickable chips that append to progression and regenerate.
+//
+// FIXES in this merge:
+// - Restores “Triads containing a note” (Find button + Enter key + clickable chips append to progression)
+// - Open voicing now matches your desired shapes:
+//     * Non-slash: [root, fifth, third] (kept compact; avoids stranded high notes)
+//     * Slash with 3rd in bass: [third, root, fifth]  (e.g. C/E -> E3 C4 G4)
+//     * Slash with 5th in bass: [fifth, third, root]  (e.g. G/D -> D3 B3 G4)
+// - Open voicing will try to keep the “body” down (prevents F becoming [F3, C5, A5] unless range forces it)
+// - At least a 5th between the bottom two notes (minSep=7) and spread control everywhere
+// - All loops that can fail are bounded to prevent p5 editor freezes
 
 let seqSymbols = [];      // [{sym, rootPc, qual, slashPc|null}]
 let seqChords = [];       // voiced MIDI arrays (per chord)
@@ -80,6 +89,8 @@ function midiNear(pc, targetMidi) {
   return best == null ? clamp(targetMidi, 0, 127) : best;
 }
 
+function pcOf(m) { return ((m % 12) + 12) % 12; }
+
 // -------------------- Chord parsing --------------------
 // Accept: C, F#, Bb, Am, Cm, D#m
 // Slash: Am/E, F/C, Cm/G
@@ -128,7 +139,7 @@ function parseProgression(str) {
 
 function triadPCs(rootPc, qual) {
   const third = (qual === "min") ? 3 : 4;
-  return [rootPc, (rootPc + third) % 12, (rootPc + 7) % 12];
+  return [rootPc, (rootPc + third) % 12, (rootPc + 7) % 12]; // [root, third, fifth]
 }
 
 function voiceClose(rootMidi, qual) {
@@ -138,19 +149,100 @@ function voiceClose(rootMidi, qual) {
   let f = midiNear(pcs[2], r + 7);
 
   let arr = sortAsc([r, t, f]);
-  for (let i = 1; i < arr.length; i++) while (arr[i] <= arr[i-1]) arr[i] += 12;
+  for (let i = 1; i < arr.length; i++) {
+    let g = 0;
+    while (arr[i] <= arr[i-1] && g++ < 24) arr[i] += 12;
+  }
   return sortAsc(arr.map(n => clamp(n, 0, 127)));
 }
 
-function voiceOpen(rootMidi, qual) {
-  const pcs = triadPCs(rootMidi % 12, qual);
-  let r = rootMidi;
-  let f = midiNear(pcs[2], r + 7);
-  let t = midiNear(pcs[1], r + 16);
+// Open voicing base builder that returns 3 notes in *requested order of chord tones*
+// orderPCs: array of PCs (length 3) representing [bottom, middle, top] chord tones
+// Targets a “body” around C4-ish but tries to keep bass below C4 when possible.
+function voiceOpenOrderedPCs(orderPCs, lo, hi, prevBassMidi = null) {
+  const [pc0, pc1, pc2] = orderPCs.map(x => ((x % 12) + 12) % 12);
 
-  let arr = sortAsc([r, f, t]);
-  for (let i = 1; i < arr.length; i++) while (arr[i] <= arr[i-1]) arr[i] += 12;
-  return sortAsc(arr.map(n => clamp(n, 0, 127)));
+  // choose bass target:
+  // - if we have previous bass, aim near it for smoothness
+  // - else aim around A3-ish (57) but keep below C4 ceiling if allowed
+  let bassTarget = (prevBassMidi == null) ? 57 : prevBassMidi;
+  let bass = midiNear(pc0, bassTarget);
+  bass = clamp(bass, 0, 127);
+
+  // keep bass below C4 if range allows
+  if (lo < BASS_CEILING_MIDI) {
+    let g = 0;
+    while (bass >= BASS_CEILING_MIDI && g++ < 24) bass -= 12;
+    g = 0;
+    while (bass < lo && g++ < 24) bass += 12;
+  } else {
+    let g = 0;
+    while (bass < lo && g++ < 24) bass += 12;
+  }
+
+  // middle: aim for a 5th-or-more above bass, but not too high
+  let mid = midiNear(pc1, bass + 7);
+
+  // ensure at least a 5th above bass
+  let g = 0;
+  while ((mid - bass) < 7 && g++ < 24) mid += 12;
+
+  // top: aim moderately above mid (avoid “C5/A5” jumps)
+  // start around mid + 4, but allow mid+16 if needed and then tighten later
+  let topA = midiNear(pc2, mid + 4);
+  let topB = midiNear(pc2, mid + 16);
+
+  // pick the top candidate that stays within a compact spread (pref <= 16) and within hi
+  const MAX_SPREAD_PREF = 16; // prefer <= 16 semitones total
+  function scoreTop(t) {
+    let tt = t;
+    let gg = 0;
+    while (tt <= mid && gg++ < 24) tt += 12;
+    // light penalty if exceeds preferred spread
+    const spread = tt - bass;
+    const over = Math.max(0, spread - MAX_SPREAD_PREF);
+    // also penalize being very high (helps avoid [F3, C5, A5])
+    const highPenalty = Math.max(0, tt - 72) * 0.05; // mild
+    return { tt, score: over * 5 + highPenalty };
+  }
+
+  const sA = scoreTop(topA);
+  const sB = scoreTop(topB);
+  let top = (sA.score <= sB.score) ? sA.tt : sB.tt;
+
+  // pack into chord and then apply global spacing control
+  let chord = [bass, mid, top];
+
+  chord = fitChordToRange(chord, lo, hi);
+  chord = enforceTriadSpacingSafe(chord, lo, hi, 7, 19);
+
+  return chord;
+}
+
+// Open voicing for a chord spec, including slash behaviour you requested.
+// - no slash: [root, fifth, third]
+// - slash is 3rd: [third, root, fifth]
+// - slash is 5th: [fifth, third, root]
+function voiceOpenWithSlash(rootPc, qual, slashPc, lo, hi, prevBassMidi = null) {
+  const pcs = triadPCs(rootPc, qual); // [root, third, fifth]
+  const root = pcs[0], third = pcs[1], fifth = pcs[2];
+
+  if (slashPc == null) {
+    return voiceOpenOrderedPCs([root, fifth, third], lo, hi, prevBassMidi);
+  }
+
+  const spc = ((slashPc % 12) + 12) % 12;
+  const isThird = spc === third;
+  const isFifth = spc === fifth;
+  const isRoot  = spc === root;
+
+  // If slash is a chord tone, NO doubling: we build exactly 3 notes in the desired order.
+  if (isThird) return voiceOpenOrderedPCs([third, root, fifth], lo, hi, prevBassMidi);
+  if (isFifth) return voiceOpenOrderedPCs([fifth, third, root], lo, hi, prevBassMidi);
+  if (isRoot)  return voiceOpenOrderedPCs([root, fifth, third], lo, hi, prevBassMidi);
+
+  // If slash is NOT a chord tone, fall back to normal open then add extra bass later
+  return voiceOpenOrderedPCs([root, fifth, third], lo, hi, prevBassMidi);
 }
 
 // clamp chord into [lo,hi] by octave shifting preserving pitch classes
@@ -158,43 +250,121 @@ function fitChordToRange(ch, lo, hi) {
   let x = sortAsc(ch);
   if (!x.length) return x;
 
-  while (Math.min(...x) < lo) x = x.map(n => n + 12);
-  while (Math.max(...x) > hi) x = x.map(n => n - 12);
+  // shift whole chord to get roughly inside
+  let guard = 0;
+  while (Math.min(...x) < lo && guard++ < 24) x = x.map(n => n + 12);
+  guard = 0;
+  while (Math.max(...x) > hi && guard++ < 24) x = x.map(n => n - 12);
 
+  // wrap each note + keep ascending
   for (let i = 0; i < x.length; i++) {
     let n = x[i];
-    while (n < lo) n += 12;
-    while (n > hi) n -= 12;
+
+    guard = 0;
+    while (n < lo && guard++ < 24) n += 12;
+    guard = 0;
+    while (n > hi && guard++ < 24) n -= 12;
 
     if (i > 0) {
-      while (n <= x[i-1]) n += 12;
-      while (n > hi && (n - 12) > x[i-1] && (n - 12) >= lo) n -= 12;
+      guard = 0;
+      while (n <= x[i-1] && guard++ < 24) n += 12;
+      guard = 0;
+      while (n > hi && (n - 12) > x[i-1] && (n - 12) >= lo && guard++ < 24) n -= 12;
     }
     x[i] = clamp(n, 0, 127);
   }
 
-  while (Math.min(...x) < lo) x = x.map(n => n + 12);
-  while (Math.max(...x) > hi) x = x.map(n => n - 12);
+  // final shift if still outside (rare)
+  guard = 0;
+  while (Math.min(...x) < lo && guard++ < 24) for (let i=0;i<x.length;i++) x[i] += 12;
+  guard = 0;
+  while (Math.max(...x) > hi && guard++ < 24) for (let i=0;i<x.length;i++) x[i] -= 12;
 
   return sortAsc(x.map(n => clamp(n, 0, 127)));
 }
 
-// Keep bass below C4 if possible (and range allows)
-function enforceBassBelowC4(ch, lo, hi) {
+// SAFE: keep bass below C4 if possible (bounded loops)
+function enforceBassBelowC4Safe(ch, lo, hi) {
   if (!ch || !ch.length) return ch;
   if (lo >= BASS_CEILING_MIDI) return fitChordToRange(ch, lo, hi);
 
   let x = sortAsc(ch).map(n => clamp(n, 0, 127));
 
-  while (x[0] >= BASS_CEILING_MIDI) x[0] -= 12;
-  while (x[0] < lo) x[0] += 12;
+  let guard = 0;
+  while (x[0] >= BASS_CEILING_MIDI && guard++ < 24) x[0] -= 12;
+  guard = 0;
+  while (x[0] < lo && guard++ < 24) x[0] += 12;
 
-  for (let i = 1; i < x.length; i++) while (x[i] <= x[i-1]) x[i] += 12;
+  for (let i = 1; i < x.length; i++) {
+    let g = 0;
+    while (x[i] <= x[i-1] && g++ < 24) x[i] += 12;
+  }
 
   return fitChordToRange(x, lo, hi);
 }
 
-// Apply slash bass:
+// SAFE spacing enforcement (never infinite):
+// - Ensure bass->second >= minSep (default 7 semitones)
+// - Tighten wide spreads by pulling upper voices down by octaves when possible
+function enforceTriadSpacingSafe(ch, lo, hi, minSep = 7, maxSpread = 19) {
+  if (!ch || ch.length < 2) return ch;
+
+  let x = fitChordToRange(sortAsc(ch), lo, hi);
+
+  // 1) min separation between first two voices
+  if (x.length >= 2) {
+    let guard = 0;
+    while ((x[1] - x[0]) < minSep && guard++ < 24) x[1] += 12;
+    // re-ascend any following voices
+    for (let i = 2; i < x.length; i++) {
+      let g = 0;
+      while (x[i] <= x[i-1] && g++ < 24) x[i] += 12;
+    }
+    x = fitChordToRange(x, lo, hi);
+  }
+
+  // 2) tighten spread (pull top voices down by octaves if it reduces spread AND keeps order)
+  for (let pass = 0; pass < 8; pass++) {
+    x = sortAsc(x);
+    const spread = x[x.length - 1] - x[0];
+    if (spread <= maxSpread) break;
+
+    let changed = false;
+    for (let i = x.length - 1; i >= 1; i--) {
+      const prev = x[i - 1];
+      const cand = x[i] - 12;
+      if (cand > prev && cand >= lo) {
+        x[i] = cand;
+        changed = true;
+      }
+    }
+
+    for (let i = 1; i < x.length; i++) {
+      let g = 0;
+      while (x[i] <= x[i-1] && g++ < 24) x[i] += 12;
+    }
+
+    x = fitChordToRange(x, lo, hi);
+    if (!changed) break;
+  }
+
+  // final: keep bass below C4 if possible
+  x = enforceBassBelowC4Safe(x, lo, hi);
+
+  // last resort: if still extremely wide, pull top down once
+  x = sortAsc(x);
+  let safety = 0;
+  while (x.length >= 3 && (x[2] - x[0]) > (maxSpread + 12) && safety++ < 8) {
+    x[2] -= 12;
+    if (x[2] <= x[1]) x[2] += 12;
+    x = fitChordToRange(x, lo, hi);
+    x = sortAsc(x);
+  }
+
+  return sortAsc(x);
+}
+
+// Apply slash bass (general-purpose for close/voicelead; open uses voiceOpenWithSlash for chord-tone slashes):
 // - If slashPc is a chord tone: NO doubling; force inversion so slash tone is lowest triad tone.
 // - Else: add extra bass note, octave chosen near prevBassMidi for smoothness.
 function applySlashBass(ch, slashPc, targetBassMidi, lo, hi, prevBassMidi = null, bassWeight = 1.0) {
@@ -207,7 +377,6 @@ function applySlashBass(ch, slashPc, targetBassMidi, lo, hi, prevBassMidi = null
   const contains = pcsInChord.includes(wantPc);
 
   if (contains) {
-    // Force inversion so a matching chord tone is the bass, without adding extra note.
     let best = null;
     let bestScore = 1e18;
 
@@ -220,17 +389,20 @@ function applySlashBass(ch, slashPc, targetBassMidi, lo, hi, prevBassMidi = null
       let bass = n0;
       const bassCeil = (lo < BASS_CEILING_MIDI) ? (BASS_CEILING_MIDI - 1) : hi;
 
-      while (bass > bassCeil) bass -= 12;
-      while (bass < lo) bass += 12;
+      let guard = 0;
+      while (bass > bassCeil && guard++ < 24) bass -= 12;
+      guard = 0;
+      while (bass < lo && guard++ < 24) bass += 12;
 
       let stacked = [bass, ...others].map(n => clamp(n, 0, 127));
       stacked = sortAsc(stacked);
-
-      // restack above bass
-      for (let i = 1; i < stacked.length; i++) while (stacked[i] <= stacked[i - 1]) stacked[i] += 12;
+      for (let i = 1; i < stacked.length; i++) {
+        let g = 0;
+        while (stacked[i] <= stacked[i - 1] && g++ < 24) stacked[i] += 12;
+      }
 
       stacked = fitChordToRange(stacked, lo, hi);
-      stacked = enforceBassBelowC4(stacked, lo, hi);
+      stacked = enforceTriadSpacingSafe(stacked, lo, hi, 7, 19);
 
       const bassNow = stacked[0];
       const bassCost = (prevBassMidi == null) ? 0 : Math.abs(bassNow - prevBassMidi);
@@ -242,29 +414,37 @@ function applySlashBass(ch, slashPc, targetBassMidi, lo, hi, prevBassMidi = null
       }
     }
 
-    return best ? best : enforceBassBelowC4(fitChordToRange(chord, lo, hi), lo, hi);
+    const fallback = enforceTriadSpacingSafe(fitChordToRange(chord, lo, hi), lo, hi, 7, 19);
+    return best ? best : fallback;
   }
 
-  // slash is NOT chord tone: add extra bass note
+  // slash is NOT chord tone: add an extra bass note
   const target = (prevBassMidi == null) ? targetBassMidi : prevBassMidi;
   let bass = midiNear(wantPc, target);
   bass = clamp(bass, 0, 127);
 
+  let guard = 0;
+
   if (lo < BASS_CEILING_MIDI) {
-    while (bass >= BASS_CEILING_MIDI) bass -= 12;
-    while (bass < lo) bass += 12;
+    guard = 0;
+    while (bass >= BASS_CEILING_MIDI && guard++ < 24) bass -= 12;
+    guard = 0;
+    while (bass < lo && guard++ < 24) bass += 12;
   } else {
-    while (bass < lo) bass += 12;
+    guard = 0;
+    while (bass < lo && guard++ < 24) bass += 12;
   }
 
   const lowest = Math.min(...chord);
-  while (bass >= lowest) bass -= 12;
-  while (bass < lo) bass += 12;
+  guard = 0;
+  while (bass >= lowest && guard++ < 24) bass -= 12;
+  guard = 0;
+  while (bass < lo && guard++ < 24) bass += 12;
 
   bass = clamp(bass, 0, 127);
 
   const out = [bass, ...chord];
-  return enforceBassBelowC4(fitChordToRange(out, lo, hi), lo, hi);
+  return enforceTriadSpacingSafe(fitChordToRange(out, lo, hi), lo, hi, 7, 19);
 }
 
 // -------------------- Voice-led (smart candidates) --------------------
@@ -281,7 +461,6 @@ function motionCost(prevChord, candChord) {
 function candidatesForTriad(rootPc, qual, targetMidi, lo, hi) {
   const pcs = triadPCs(rootPc, qual);
 
-  // inversions (lowest voice first, as pcs)
   const inversions = [
     [pcs[0], pcs[1], pcs[2]],
     [pcs[1], pcs[2], pcs[0]],
@@ -297,15 +476,16 @@ function candidatesForTriad(rootPc, qual, targetMidi, lo, hi) {
       let b = midiNear(inv[1], a + 4);
       let c = midiNear(inv[2], b + 4);
 
-      while (b <= a) b += 12;
-      while (c <= b) c += 12;
+      let g = 0;
+      while (b <= a && g++ < 24) b += 12;
+      g = 0;
+      while (c <= b && g++ < 24) c += 12;
 
       const chord = fitChordToRange([a, b, c], lo, hi);
       cands.push(chord);
     }
   }
 
-  // de-dupe
   const seen = new Set();
   const uniq = [];
   for (const ch of cands) {
@@ -333,18 +513,14 @@ function voiceLeadSequenceSmart(chordSpecs, lo, hi, bassWeight) {
 
     const prevBass = prev ? sortAsc(prev)[0] : null;
 
-    // evaluate candidates AFTER applying slash (because slash affects bass & doubling rules)
-    const fallback = fitChordToRange(voiceClose(spec.rootMidi, spec.qual), lo, hi);
-    const pool = cands.length ? cands : [fallback];
-
-    for (const cand of pool) {
+    for (const cand of (cands.length ? cands : [fitChordToRange(voiceClose(spec.rootMidi, spec.qual), lo, hi)])) {
       let ch = fitChordToRange(cand, lo, hi);
       ch = applySlashBass(ch, spec.slashPc, targetBass, lo, hi, prevBass, bassWeight);
-      ch = enforceBassBelowC4(ch, lo, hi);
+      ch = enforceTriadSpacingSafe(ch, lo, hi, 7, 19);
 
-      // motion
       const upper = prev ? motionCost(prev, ch) : 0;
       const bass = (prevBass == null || !ch.length) ? 0 : Math.abs(ch[0] - prevBass);
+
       const score = upper + bassWeight * bass;
 
       if (score < bestScore) {
@@ -353,7 +529,7 @@ function voiceLeadSequenceSmart(chordSpecs, lo, hi, bassWeight) {
       }
     }
 
-    if (!best) best = enforceBassBelowC4(fallback, lo, hi);
+    if (!best) best = enforceTriadSpacingSafe(fitChordToRange(voiceClose(spec.rootMidi, spec.qual), lo, hi), lo, hi, 7, 19);
 
     out.push(best);
     prev = best;
@@ -376,7 +552,6 @@ function generateSequence() {
 
   seqSymbols = parseProgression(progStr);
 
-  // choose a root register target around C4-ish
   const targetRoot = 60;
   const chordSpecs = seqSymbols.map(obj => {
     const rootMidi = midiNear(obj.rootPc, targetRoot);
@@ -387,18 +562,44 @@ function generateSequence() {
 
   if (voicingMode === "voicelead") {
     voiced = voiceLeadSequenceSmart(chordSpecs, lo, hi, bassWeight);
-  } else {
-    const baseVoicer = (voicingMode === "open") ? voiceOpen : voiceClose;
-    const targetBass = lo + Math.round((hi - lo) * 0.20);
 
+  } else if (voicingMode === "open") {
+    // OPEN: use your requested ordering rules
+    const targetBass = lo + Math.round((hi - lo) * 0.20);
     let prevBass = null;
 
     voiced = chordSpecs.map(spec => {
-      let ch = baseVoicer(spec.rootMidi, spec.qual);
+      const rootPc = pcOf(spec.rootMidi);
+
+      // 1) build the 3-tone open chord (including chord-tone slash orders, no doubling)
+      let ch = voiceOpenWithSlash(rootPc, spec.qual, spec.slashPc, lo, hi, prevBass);
+
+      // 2) if slash is NOT a chord tone, we still need to add extra bass
+      const pcs = triadPCs(rootPc, spec.qual);
+      const chordToneSlash = (spec.slashPc != null) && (pcs.includes(((spec.slashPc % 12) + 12) % 12));
+
+      if (spec.slashPc != null && !chordToneSlash) {
+        ch = applySlashBass(ch, spec.slashPc, targetBass, lo, hi, prevBass, bassWeight);
+      }
+
+      // 3) final guards
+      ch = enforceTriadSpacingSafe(ch, lo, hi, 7, 19);
+
+      prevBass = ch.length ? ch[0] : prevBass;
+      return ch;
+    });
+
+  } else {
+    // CLOSE (default)
+    const targetBass = lo + Math.round((hi - lo) * 0.20);
+    let prevBass = null;
+
+    voiced = chordSpecs.map(spec => {
+      let ch = voiceClose(spec.rootMidi, spec.qual);
       ch = fitChordToRange(ch, lo, hi);
 
       ch = applySlashBass(ch, spec.slashPc, targetBass, lo, hi, prevBass, bassWeight);
-      ch = enforceBassBelowC4(ch, lo, hi);
+      ch = enforceTriadSpacingSafe(ch, lo, hi, 7, 19);
 
       prevBass = ch.length ? ch[0] : prevBass;
       return ch;
@@ -416,7 +617,7 @@ function updateOutputs(lo, hi) {
   const voicingMode = document.getElementById("voicingSel")?.value || "close";
   const bassWeight = clamp(Number(document.getElementById("bassWeight")?.value ?? 1.2), 0, 3);
 
-  const bassRule = (lo < BASS_CEILING_MIDI) ? "bass < C4 enforced" : "bass < C4 not possible (clamp low >= C4)";
+  const bassRule = (lo < BASS_CEILING_MIDI) ? "bass < C4 enforced (when possible)" : "bass < C4 not possible (clamp low >= C4)";
 
   if (statusOut) {
     statusOut.textContent =
@@ -425,6 +626,7 @@ function updateOutputs(lo, hi) {
       `Bass smoothness weight = ${bassWeight.toFixed(1)}\n` +
       `Clamp range = ${midiToNote(lo)} (${lo}) → ${midiToNote(hi)} (${hi})\n` +
       `Bass rule = ${bassRule}\n` +
+      `Spacing rule = min 5th above bass + spread control\n` +
       `Parsed: ${seqSymbols.map(x => x.sym).join(" | ")}\n`;
   }
 
@@ -505,7 +707,6 @@ function buildMidiFile(events, opts) {
       carryDelta = restTicks;
     }
 
-    // final wait (optional)
     pushVar(track, carryDelta);
   } else {
     const chordTicks = beatToTicks(chordDurationBeats);
@@ -596,7 +797,18 @@ function pcToPrettyName(pc) {
 function triadsContainingPC(pc) {
   const mod12 = (x) => ((x % 12) + 12) % 12;
 
+  // Major triad contains pc as: root, 3rd, or 5th
+  // If pc is:
+  //  - root => root = pc
+  //  - 3rd  => root = pc - 4
+  //  - 5th  => root = pc - 7
   const majRoots = [mod12(pc), mod12(pc - 4), mod12(pc - 7)];
+
+  // Minor triad contains pc as: root, b3, or 5th
+  // If pc is:
+  //  - root => root = pc
+  //  - b3   => root = pc - 3
+  //  - 5th  => root = pc - 7
   const minRoots = [mod12(pc), mod12(pc - 3), mod12(pc - 7)];
 
   const uniq = (arr) => Array.from(new Set(arr));
@@ -616,7 +828,6 @@ function appendChordToProgression(sym) {
   if (!current) {
     progIn.value = sym;
   } else {
-    // append with comma + space
     progIn.value = current.replace(/[,\s]*$/, "") + ", " + sym;
   }
   safeGenerate();
@@ -646,7 +857,10 @@ function renderTriadChips(title, list) {
     btn.style.padding = "8px 10px";
     btn.style.borderRadius = "999px";
     btn.style.fontSize = "12px";
-    btn.addEventListener("click", () => appendChordToProgression(sym));
+    btn.addEventListener("click", (e) => {
+      e.preventDefault();
+      appendChordToProgression(sym);
+    });
     row.appendChild(btn);
   }
 
@@ -707,8 +921,8 @@ function setupUI() {
   const restIn = document.getElementById("restIn");
 
   // defaults (only set if empty, so you can keep your own)
-  if (progIn && !progIn.value.trim()) progIn.value = "Am, G, C/E, F";
-  if (voicingSel) voicingSel.value = voicingSel.value || "voicelead";
+  if (progIn && !progIn.value.trim()) progIn.value = "Am, F, G, C/E, G/D, C/E, F";
+  if (voicingSel) voicingSel.value = voicingSel.value || "open";
   if (rangeLo && !rangeLo.value.trim()) rangeLo.value = "C2";
   if (rangeHi && !rangeHi.value.trim()) rangeHi.value = "C6";
 
@@ -740,10 +954,10 @@ function setupUI() {
   syncBassLabel();
 
   document.getElementById("exampleBtn")?.addEventListener("click", () => {
-    if (progIn) progIn.value = "Dm, Bb, F, C, Dm/A, Bb/F, C/G";
-    if (voicingSel) voicingSel.value = "voicelead";
+    if (progIn) progIn.value = "Am, F, G, C/E, G/D, C/E, F";
+    if (voicingSel) voicingSel.value = "open";
     if (midiStyleSel) midiStyleSel.value = "block";
-    if (bassWeight) bassWeight.value = "1.6";
+    if (bassWeight) bassWeight.value = "1.2";
     syncBassLabel();
     syncArpUI();
     safeGenerate();
@@ -786,11 +1000,25 @@ function setupUI() {
     downloadBytes(midiBytes, "triad-progression.mid", "audio/midi");
   });
 
-  // --- triads containing note ---
-  document.getElementById("noteQueryBtn")?.addEventListener("click", () => updateTriadQueryUI());
-  document.getElementById("noteQueryIn")?.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") updateTriadQueryUI();
+  // --- triads containing note (RESTORED + robust) ---
+  const noteBtn = document.getElementById("noteQueryBtn");
+  const noteIn = document.getElementById("noteQueryIn");
+
+  noteBtn?.addEventListener("click", (e) => {
+    e.preventDefault();          // important if inside any form-like container
+    updateTriadQueryUI();
   });
+
+  noteIn?.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      updateTriadQueryUI();
+    }
+  });
+
+  // Optional: live update as they type
+  noteIn?.addEventListener("input", () => updateTriadQueryUI());
+
   updateTriadQueryUI();
 
   // initial
